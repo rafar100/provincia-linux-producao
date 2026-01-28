@@ -1,87 +1,99 @@
 #!/bin/bash
 
+set -e
+
 echo "------------------------------------------------"
 echo "INICIANDO SCRIPT DE CONFIGURAÇÃO - PROVINCIA"
 echo "------------------------------------------------"
 
-echo "1/7 - Atualizando repositórios e sistema..."
-sudo apt update && sudo apt upgrade -y
-
-echo "2/7 - Instalando Zabbix Agent (v7.4)..."
-if ! sudo apt install zabbix-agent -y; then
-    echo "Aviso: Repositório padrão falhou. Baixando .deb oficial..."
-    wget -q https://repo.zabbix.com/zabbix/7.4/release/ubuntu/pool/main/z/zabbix-release/zabbix-release_7.4-1+ubuntu24.04_all.deb
-    sudo dpkg -i zabbix-release_7.4-1+ubuntu24.04_all.deb
-    sudo apt update
-    sudo apt install zabbix-agent -y
-fi
-
-echo "3/7 - Configurando Hostname automático e Zabbix Conf..."
+ZABBIX_SERVER="192.168.40.101"
 HOSTNAME_ATUAL=$(hostname)
-sudo bash -c "cat > /etc/zabbix/zabbix_agentd.conf << EOF
+
+echo "1/6 - Atualizando sistema..."
+apt update && apt upgrade -y
+
+echo "2/6 - Instalando repositório oficial do Zabbix 7.4..."
+wget -q https://repo.zabbix.com/zabbix/7.4/release/ubuntu/pool/main/z/zabbix-release/zabbix-release_7.4-1+ubuntu24.04_all.deb
+dpkg -i zabbix-release_7.4-1+ubuntu24.04_all.deb
+apt update
+apt install zabbix-agent -y
+
+echo "3/6 - Instalando pacotes de segurança e SSH..."
+apt install -y openssh-server chkrootkit clamav clamav-daemon
+
+echo "4/6 - Configurando Zabbix Agent..."
+cat > /etc/zabbix/zabbix_agentd.conf << EOF
 ####### GENERAL PARAMETERS #################
-LogFile=/tmp/zabbix_agentd.log
-Server=192.168.40.101
-ServerActive=192.168.40.101
+LogFile=/var/log/zabbix/zabbix_agentd.log
+Server=$ZABBIX_SERVER
+ServerActive=$ZABBIX_SERVER
 Hostname=$HOSTNAME_ATUAL
-UserParameter=antivirus.clamav,if command -v clamscan >/dev/null 2>&1; then echo \"ClamAV instalado\"; else echo \"ClamAV ausente\"; fi
-UserParameter=antivirus.chkrootkit,if command -v chkrootkit >/dev/null 2>&1; then echo \"chkrootkit instalado\"; else echo \"chkrootkit ausente\"; fi
-############ GENERAL PARAMETERS ###########
-EOF"
 
-echo "4/7 - Instalando SSH, Chkrootkit e ClamAV..."
-sudo apt install openssh-server chkrootkit clamav clamav-daemon -y
+UserParameter=antivirus.clamav,command -v clamscan >/dev/null 2>&1 && echo "INSTALADO" || echo "AUSENTE"
+UserParameter=antivirus.chkrootkit,command -v chkrootkit >/dev/null 2>&1 && echo "INSTALADO" || echo "AUSENTE"
+###########################################
+EOF
 
-echo "5/7 - Criando serviços e Timers do Systemd..."
-# Chkrootkit Service/Timer
-sudo bash -c "cat > /etc/systemd/system/chkrootkit.service << EOF
+systemctl enable zabbix-agent
+systemctl restart zabbix-agent
+
+echo "5/6 - Criando serviços e timers de segurança..."
+
+# Chkrootkit Service
+cat > /etc/systemd/system/chkrootkit.service << EOF
 [Unit]
 Description=Verificação de Rootkits
-After=network.target
 
 [Service]
+Type=oneshot
 ExecStart=/usr/sbin/chkrootkit
-StandardOutput=null
-EOF"
+StandardOutput=append:/var/log/chkrootkit.log
+EOF
 
-sudo bash -c "cat > /etc/systemd/system/chkrootkit.timer << EOF
+# Chkrootkit Timer
+cat > /etc/systemd/system/chkrootkit.timer << EOF
 [Unit]
-Description=Rodar chkrootkit ao meio-dia
+Description=Chkrootkit diário
 
 [Timer]
-OnCalendar=08:30
+OnCalendar=*-*-* 12:00:00
 Persistent=true
 
 [Install]
 WantedBy=timers.target
-EOF"
+EOF
 
-# ClamAV Timer
-sudo bash -c "cat > /etc/systemd/system/clamavscan.timer << EOF
+# ClamAV Scan Service
+cat > /etc/systemd/system/clamavscan.service << EOF
 [Unit]
-Description=Rodar ClamAV ao meio-dia
+Description=Scan ClamAV
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/clamscan -r /home --log=/var/log/clamscan.log --quiet
+EOF
+
+# ClamAV Scan Timer
+cat > /etc/systemd/system/clamavscan.timer << EOF
+[Unit]
+Description=Scan ClamAV diário
 
 [Timer]
-OnCalendar=12:05
+OnCalendar=*-*-* 12:10:00
 Persistent=true
 
 [Install]
 WantedBy=timers.target
-EOF"
+EOF
 
-echo "6/7 - Habilitando serviços..."
-sudo systemctl daemon-reload
-sudo systemctl enable --now chkrootkit.timer
-sudo systemctl enable --now clamavscan.timer
-
-echo "7/7 - Configurando tarefas no Cron..."
-(crontab -l 2>/dev/null; echo "0 12 * * * /usr/sbin/chkrootkit > /var/log/chkrootkit.log 2>&1") | crontab -
-(crontab -l 2>/dev/null; echo "0 12 * * * /usr/bin/freshclam > /var/log/freshclam.log 2>&1") | crontab -
-(crontab -l 2>/dev/null; echo "5 12 * * * /usr/bin/clamscan -r --quiet --log=/var/log/clamscan.log --remove /home") | crontab -
-(crontab -l 2>/dev/null; echo "0 11 * * * rm -rf ~/.cache/mozilla/firefox/*.default-release/cache2/* && rm -rf ~/Downloads/*") | crontab -
-(crontab -l 2>/dev/null; echo "30 11 * * * sudo apt update -y && sudo apt upgrade -y") | crontab -
+echo "6/6 - Ativando timers..."
+systemctl daemon-reload
+systemctl enable --now chkrootkit.timer
+systemctl enable --now clamavscan.timer
+systemctl enable clamav-daemon
+systemctl restart clamav-daemon
 
 echo "------------------------------------------------"
 echo "✅ PROCEDIMENTO CONCLUÍDO COM SUCESSO!"
-echo "PC: $HOSTNAME_ATUAL | IP Server: 192.168.40.101"
+echo "Host: $HOSTNAME_ATUAL | Zabbix Server: $ZABBIX_SERVER"
 echo "------------------------------------------------"
